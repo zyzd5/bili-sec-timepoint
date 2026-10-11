@@ -70,11 +70,14 @@
 <h1>mock player — bili-sec-timepoint</h1>
 <p class="hint">
   选择本地视频，然后切换下方三种布局，确认读数出现在正确位置。
-  "modern" = 真实 bpx 类名；"renamed" = 类名被改掉，靠文本启发式发现；“bare” = 完全没有时钟节点，走浮层兜底。
+  "modern" = 真实 bpx 类名；"renamed" = 类名被改掉，靠文本启发式发现；“bare” = 完全没有时钟节点——脚本会选择<strong>什么都不显示</strong>，而不是往播放器上钉一个浮层。
   下方两个按钮可以对比<strong>插件样式（只有剩余秒数）/ B 站默认样式</strong>，以及<strong>剩余 / 已播</strong>。
   <br>
   插件样式下<strong>直接点击时间点本身</strong>即可在这两种样式之间来回切换 —— 页面里的模拟时钟也接了同样的处理器，
   点击它会打印一行日志，用来确认脚本确实把 B 站原本的“点击输入时间点”给拦下来了。
+  <br>
+  把鼠标移到读数上：它应该<strong>只是稍微变亮，颜色不变</strong>（和 B 站原生时钟一致），而不是变蓝。
+  唯一的例外是 <kbd>Alt</kbd>+<kbd>C</kbd> 复制成功后的那一秒蓝字提示。
 </p>
 
 <div class="file-row">
@@ -84,7 +87,7 @@
 <div class="bar">
   <button data-fixture="modern" aria-pressed="true">modern (bpx 类名)</button>
   <button data-fixture="renamed" aria-pressed="false">renamed (启发式)</button>
-  <button data-fixture="bare" aria-pressed="false">bare (浮层兜底)</button>
+  <button data-fixture="bare" aria-pressed="false">bare (无时钟节点)</button>
 </div>
 
 <div class="bar">
@@ -138,7 +141,7 @@
         '<span class="weird-clock-total">00:00</span>' +
       '</div>',
 
-    // No clock at all: the script must fall back to a floating overlay.
+    // No clock at all: the script must show NOTHING and leave the player alone.
     bare: '',
   };
 
@@ -149,11 +152,11 @@
     if (!api) { return; }
     api.teardown();
     /*
-     * A player that HAS had a clock must miss several heartbeats in a row before
-     * the script is willing to conclude "this player has no clock" — that grace
-     * period is what keeps a control-bar rebuild from stamping a stray inline
-     * `position:relative` onto the player (which broke web fullscreen once).
-     * Rather than make the tester wait ~3 s, replay the misses immediately.
+     * The "no clock found" warning is deliberately held back for several
+     * heartbeats (~3 s), so that a control-bar rebuild does not spam the
+     * console on first paint. Replay those misses immediately instead of making
+     * the tester wait — and to see the bare fixture's message, open the
+     * console.
      */
     for (var i = 0; i < 7; i++) { api.ensureInjected(); }
     api.update(true);
@@ -226,7 +229,8 @@
         ? 'current=' + (guessed.current.className || guessed.current.tagName) +
           ', duration=' + (guessed.duration ? guessed.duration.className || guessed.duration.tagName : 'null')
         : 'null (nothing clock-like found)') + '\n' +
-      'overlay in use    -> ' + !!document.querySelector('.bst-sec--overlay') + '\n' +
+      'readout           -> ' + (document.querySelector('.bst-sec') ? 'inline' : 'none (no clock node found, so nothing is shown)') + '\n' +
+      'inline layout on a player element -> ' + !!document.querySelector('[style*="position"]') + '\n' +
       'our readout style -> ' + (function () {
         var badge = document.querySelector('.bst-sec');
         if (!badge) { return 'no readout'; }

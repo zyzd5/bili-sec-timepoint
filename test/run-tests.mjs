@@ -6,7 +6,7 @@
  *
  *   1. modern  — today's `.bpx-player-ctrl-time-*` markup (exact selectors)
  *   2. renamed — the same structure with unknown class names (heuristic path)
- *   3. bare    — a player with no clock node at all (overlay fallback)
+ *   3. bare    — a player with no clock node at all (nothing is displayed)
  *
  * jsdom does not implement media playback, so the <video> element's
  * `currentTime` / `duration` / `paused` are replaced with controllable stubs.
@@ -111,7 +111,7 @@ function boot(html, { url = 'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2', 
   window.GM_unregisterMenuCommand = () => {};
 
   // --- console capture --------------------------------------------
-  // The startup banner and the "fell back to the overlay" message are the two
+  // The startup banner and the "found no clock" message are the two
   // diagnostics a user relies on to tell "script never ran" apart from "script
   // ran but found no clock", so they are asserted below.
   const logs = [];
@@ -249,7 +249,29 @@ async function testModern() {
   check('live seconds counts down from the duration', badge.textContent, '387s');
   check('there is exactly one readout', t.doc.querySelectorAll('.bst-sec').length, 1);
   checkThat('no duration readout is added any more', !badgeOf(t.doc, '.bst-sec--duration'));
-  checkThat('no fallback overlay used', t.doc.querySelectorAll('.bst-sec--overlay').length === 0);
+  checkThat('no floating readout is ever created', t.doc.querySelectorAll('.bst-sec--overlay').length === 0);
+
+  group('modern player: hover brightens instead of turning blue');
+  /*
+   * bilibili's own clock stays white and just brightens under the cursor, so
+   * the plugin readout must do the same. The one deliberate exception is the
+   * transient "copied" flash after Alt+C, which stays blue so it remains
+   * distinguishable from hovering.
+   */
+  const css = t.doc.getElementById('bst-style').textContent;
+  const soloHover = (css.match(/\.bst-sec\.bst-sec--solo:hover\{[^}]*\}/) || [''])[0];
+  checkThat('the solo hover rule exists', soloHover.length > 0);
+  checkThat('it does not switch the colour to bilibili blue', soloHover.indexOf('#00aeec') === -1);
+  checkThat('it re-declares the borrowed clock colour', soloHover.indexOf('var(--bst-clock-color') !== -1);
+  checkThat('it lifts the borrowed opacity to full', /opacity:1/.test(soloHover));
+  checkThat('and it brightens the text', /brightness\(/.test(soloHover));
+  const soloFlash = (css.match(/\.bst-sec\.bst-sec--solo\.bst-sec--copied\{[^}]*\}/) || [''])[0];
+  checkThat(
+    'the copied flash stays distinguishable (blue, no brightening)',
+    soloFlash.indexOf('#00aeec') !== -1 && soloFlash.indexOf('brightness') === -1
+  );
+  const baseRule = (css.match(/\.bst-sec\{[^}]*\}/) || [''])[0];
+  checkThat('the brightening is transitioned, not instant', /transition:[^;}]*filter/.test(baseRule));
 
   group('modern player: live updates');
   t.mediaState.currentTime = 12.5;
@@ -398,7 +420,7 @@ async function testRenamed() {
   const elapsed = t.doc.querySelector('.weird-clock-elapsed');
   checkThat('anchored to the elapsed clock', badge && badge.previousElementSibling === elapsed);
   check('live seconds counts down', badge.textContent, '387s');
-  checkThat('heuristically found the clock, so no overlay', t.doc.querySelectorAll('.bst-sec--overlay').length === 0);
+  checkThat('heuristically found the clock, so nothing floats', t.doc.querySelectorAll('.bst-sec--overlay').length === 0);
 
   // The unknown box is not in SELECTORS.timeBox, so the fallback path hides the
   // three pieces individually — including the "/" divider, which is found by
@@ -423,39 +445,72 @@ async function testRenamed() {
 }
 
 /* ------------------------------------------------------------------ *
- * 4. Bare player (overlay fallback)
+ * 4. Bare player (no clock node at all)
+ *
+ * There is deliberately NO fallback display: an earlier version floated a
+ * readout in the bottom-left corner, which required stamping an inline
+ * `position:relative` onto the player container, and that silently disabled
+ * bilibili's web fullscreen (inline styles outrank the stylesheet, and web
+ * fullscreen works by switching the same container to `position:fixed`).
  * ------------------------------------------------------------------ */
 
 async function testBare() {
   const t = boot(PLAYER_BARE);
   check('no init errors', t.errors.length, 0);
+  const root = t.doc.querySelector('#bilibili-player');
 
-  group('bare player: overlay fallback');
-  const overlay = badgeOf(t.doc, '.bst-sec--overlay');
-  checkThat('overlay badge exists', !!overlay);
-  checkThat('overlay is inside the player root', t.doc.querySelector('#bilibili-player').contains(overlay));
-  check('overlay shows remaining seconds', overlay.textContent, '387s');
-  check('no inline badge was created', t.doc.querySelectorAll('.bst-sec:not(.bst-sec--overlay)').length, 0);
+  group('bare player: nothing is displayed');
+  check('no readout at all', t.doc.querySelectorAll('.bst-sec').length, 0);
+
+  group('bare player: the player layout is left completely alone');
+  check('player root has no inline style', root.getAttribute('style') || '', '');
+  check('player root was not made relative', root.style.position, '');
+  checkThat('no position stamp marker', !root.hasAttribute('data-bst-positioned'));
+  check('no repositioned roots in the inventory', t.doc.querySelectorAll('[data-bst-positioned]').length, 0);
+  checkThat('the report no longer even tracks repositioned roots', !('repositionedRoots' in t.api.describeMutations()));
+
+  group('bare player: the warning waits out the grace period');
+  // The control bar is rebuilt on quality/fullscreen changes, so one or two
+  // misses are normal and must not spam the console on first paint.
+  checkThat('no scary log at startup', !t.logs.some((l) => l.indexOf('没找到') !== -1));
+  for (let i = 0; i < 3; i++) t.api.ensureInjected();
+  checkThat('still quiet after a few misses', !t.logs.some((l) => l.indexOf('没找到') !== -1));
+  for (let i = 0; i < 6; i++) t.api.ensureInjected();
+  checkThat(
+    'the warning appears once the miss is persistent',
+    t.logs.some((l) => l.indexOf('没找到') !== -1)
+  );
+  checkThat(
+    'and it tells the user which command to run',
+    t.logs.some((l) => l.indexOf('resolveTimeNodes') !== -1)
+  );
+  check('still nothing displayed', t.doc.querySelectorAll('.bst-sec').length, 0);
+  check('root still untouched', root.getAttribute('style') || '', '');
 
   group('bare player: the console explains what happened');
   checkThat(
     'a startup banner proves the script ran at all',
     t.logs.some((l) => l.indexOf('[bili-sec-timepoint]') === 0)
   );
-  checkThat('the banner reports the version', t.logs.some((l) => l.indexOf('v1.3.1') !== -1));
-  checkThat(
-    'the fallback warning tells the user which command to run',
-    t.logs.some((l) => l.indexOf('resolveTimeNodes') !== -1)
-  );
+  checkThat('the banner reports the version', t.logs.some((l) => l.indexOf('v1.4.0') !== -1));
 
-  group('bare player: recovery');
-  // Simulate a player re-render that wipes the overlay.
-  overlay.remove();
-  checkThat('overlay gone', !t.doc.querySelector('.bst-sec'));
+  group('bare player: recovery when a clock finally shows up');
+  // Bilibili renders the control bar a moment after the video element appears,
+  // so the first heartbeats legitimately find no clock. Once one shows up the
+  // readout must attach without any layout hackery.
+  const bar = t.doc.querySelector('.bpx-player-control-bottom');
+  bar.innerHTML =
+    '<div class="bpx-player-ctrl-time">' +
+    '<span class="bpx-player-ctrl-time-current">00:02</span>' +
+    '<span class="bpx-player-ctrl-time-divide">/</span>' +
+    '<span class="bpx-player-ctrl-time-duration">06:29</span>' +
+    '</div>';
   t.api.heartbeat();
-  const restored = badgeOf(t.doc, '.bst-sec--overlay');
-  checkThat('heartbeat re-injects the overlay', !!restored);
-  check('restored value', restored.textContent, '387s');
+  const restored = badgeOf(t.doc);
+  checkThat('the readout appears once a clock node exists', !!restored);
+  check('restored value', restored && restored.textContent, '387s');
+  checkThat('and it is inline, not floating', !!restored && !restored.classList.contains('bst-sec--overlay'));
+  check('nothing was repositioned to accommodate it', root.getAttribute('style') || '', '');
 
   t.window.close();
 }
@@ -542,22 +597,24 @@ async function testSpaNavigation() {
 /* ------------------------------------------------------------------ *
  * 7. Web-fullscreen safety
  *
- * Regression for the worst bug this script has had: the fallback overlay made
+ * Regression for the worst bug this script has had: a fallback overlay made
  * bilibili's player container `position:relative` with an INLINE style. Inline
  * outranks the stylesheet, and web fullscreen works by switching that same
  * container to `position:fixed` — so a leftover stamp disabled 网页全屏 for
- * good, even after the overlay was gone.
+ * good. The overlay is gone; these assertions pin down that no code path can
+ * ever touch a player element's layout again.
  * ------------------------------------------------------------------ */
 
 function testFullscreenSafety() {
   const t = boot(PLAYER_MODERN);
   const root = t.doc.querySelector('#bilibili-player');
+  const container = t.doc.querySelector('.bpx-player-container');
 
   group('web fullscreen: a healthy player is never restyled');
   check('player root keeps an empty style attribute', root.getAttribute('style') || '', '');
+  check('player container keeps an empty style attribute', container.getAttribute('style') || '', '');
   checkThat('nothing is marked as repositioned', t.doc.querySelectorAll('[data-bst-positioned]').length === 0);
   checkThat('the readout is inline as usual', !!badgeOf(t.doc));
-  check('inventory agrees', t.api.describeMutations().repositionedRoots.length, 0);
 
   // A control-bar rebuild (quality switch / fullscreen toggle) wipes the clock
   // for a tick or two. That must NOT be mistaken for "this player has no clock".
@@ -566,29 +623,33 @@ function testFullscreenSafety() {
   const stash = clock.parentNode;
   clock.remove();
   for (let i = 0; i < 3; i++) t.api.ensureInjected();
-  checkThat('no overlay during the grace period', !t.doc.querySelector('.bst-sec--overlay'));
+  check('nothing displayed during the gap', t.doc.querySelectorAll('.bst-sec').length, 0);
   check('root still has no inline position', root.getAttribute('style') || '', '');
+  check('container still has no inline position', container.getAttribute('style') || '', '');
   checkThat('still nothing marked as repositioned', t.doc.querySelectorAll('[data-bst-positioned]').length === 0);
 
-  group('web fullscreen: a persistent miss does fall back');
-  for (let i = 0; i < 10; i++) t.api.ensureInjected();
-  checkThat('overlay appeared after the grace period', !!t.doc.querySelector('.bst-sec--overlay'));
-  check('the stamp recorded an empty previous value', root.getAttribute('data-bst-positioned'), '');
-  check('the root was made relative', root.style.position, 'relative');
-  check('inventory reports the stamp', t.api.describeMutations().repositionedRoots.length, 1);
+  group('web fullscreen: a persistent miss never touches the layout either');
+  // Even after far more misses than any grace period, the old design would have
+  // stamped the container and broken web fullscreen. Nothing may happen now.
+  for (let i = 0; i < 40; i++) t.api.ensureInjected();
+  check('still nothing displayed', t.doc.querySelectorAll('.bst-sec').length, 0);
+  check('root still has no inline position', root.getAttribute('style') || '', '');
+  check('container still has no inline position', container.getAttribute('style') || '', '');
+  check('no inline position anywhere in the document', t.doc.querySelectorAll('[style*="position"]').length, 0);
+  checkThat('no stamp marker anywhere', t.doc.querySelectorAll('[data-bst-positioned]').length === 0);
 
-  group('web fullscreen: the stamp is undone as soon as the clock returns');
+  group('web fullscreen: the readout comes back as an inline badge');
   stash.appendChild(clock);
   t.api.ensureInjected();
-  checkThat('overlay removed', !t.doc.querySelector('.bst-sec--overlay'));
-  check('inline position removed again', root.style.position, '');
-  checkThat('marker cleared', !root.hasAttribute('data-bst-positioned'));
-  checkThat('the inline readout is back', t.doc.querySelectorAll('.bst-sec:not(.bst-sec--overlay)').length > 0);
+  checkThat('the inline readout is back', t.doc.querySelectorAll('.bst-sec').length === 1);
+  check('and it is not a floating one', t.doc.querySelectorAll('.bst-sec--overlay').length, 0);
+  check('root still has no inline position', root.getAttribute('style') || '', '');
+  check('container still has no inline position', container.getAttribute('style') || '', '');
 
   group('web fullscreen: the escape hatch');
   const report = t.api.revertDomMutations();
   check('nothing hidden', report.hiddenClocks.length, 0);
-  check('nothing repositioned', report.repositionedRoots.length, 0);
+  checkThat('the report has no repositioned roots field', !('repositionedRoots' in report));
   check('no errors along the way', t.errors.length, 0);
 
   t.window.close();

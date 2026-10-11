@@ -2,7 +2,7 @@
 // @name         Bilibili 秒级时间点 (bili-sec-timepoint)
 // @name:en      Bilibili Second Timepoint
 // @namespace    https://github.com/local/bili-sec-timepoint
-// @version      1.3.1
+// @version      1.4.0
 // @description  把 B 站播放器的时间区域改成只显示「距离视频结束还剩多少秒」；点击时间点即可在插件样式与 B 站默认样式之间切换，Alt+C 复制带 ?t= 的时间点链接。
 // @description:en  Replace the bilibili player clock with a plain seconds-remaining countdown. Click the timepoint to switch back to bilibili's own clock; Alt+C copies a ?t=<seconds> link.
 // @author       bili-sec-timepoint
@@ -28,9 +28,15 @@
  *
  *   1. exact selectors of every known player generation;
  *   2. a structural heuristic: the only leaf node inside the control bar
- *      whose text looks like `mm:ss` (or `hh:mm:ss`);
- *   3. a floating overlay anchored to the player container, used when the
- *      clock node cannot be found at all.
+ *      whose text looks like `mm:ss` (or `hh:mm:ss`).
+ *
+ * There is deliberately no floating-overlay fallback. An earlier version
+ * pinned one to the bottom-left corner of the player, which required stamping
+ * an inline `position` onto the player container; inline styles outrank the
+ * stylesheet, and bilibili implements web fullscreen with `position:fixed` on
+ * that same container, so the stamp permanently broke web fullscreen. When no
+ * clock node can be found the script now simply shows nothing (and says so in
+ * the console) rather than touching the player's layout.
  *
  * A polling heartbeat re-attaches the readout after any re-render, and also
  * detects bilibili's client-side (SPA) navigation between videos.
@@ -44,13 +50,12 @@
 
   const CLS_SEC = 'bst-sec';            // the live seconds readout
   const CLS_SOLO = 'bst-sec--solo';     // ...when it is the ONLY time shown
-  const CLS_OVERLAY = 'bst-sec--overlay'; // fallback floating variant
   const CLS_FLASH = 'bst-sec--copied';  // "copied" feedback state
   const CLS_STYLE = 'bst-style';
 
   const STORE_KEY = 'bst:config';
   const CONFIG_VERSION = 2;             // bump to reset display keys on upgrade
-  const VERSION = '1.3.1';
+  const VERSION = '1.4.0';
   const HEARTBEAT_MS = 500;
   const FLASH_MS = 1100;
   const TICK_MIN_INTERVAL_MS = 80;      // throttle for the per-frame update loop
@@ -77,15 +82,14 @@
 
   /** Marks the native clock nodes whose `display` this script overrode. */
   const HIDDEN_ATTR = 'data-bst-hidden';
-  /** Marks player containers whose `position` this script overrode. */
-  const POSITIONED_ATTR = 'data-bst-positioned';
   /**
    * How many consecutive heartbeats a missing clock node must persist before we
-   * give up and use the floating overlay. The control bar is rebuilt on quality
-   * and fullscreen switches, so a transient miss is normal and must NOT trigger
-   * the fallback (that is what used to break web fullscreen).
+   * tell the user in the console that nothing will be displayed. The control
+   * bar is rebuilt on quality and fullscreen switches, so a transient miss is
+   * normal and must not produce a scary log line. This only gates the message —
+   * it never triggers a fallback display.
    */
-  const OVERLAY_AFTER_MISSES = 6;   // ~3s at HEARTBEAT_MS = 500
+  const WARN_AFTER_MISSES = 6;   // ~3s at HEARTBEAT_MS = 500
 
   const DEFAULT_CONFIG = {
     configVersion: CONFIG_VERSION,
@@ -133,16 +137,12 @@
       '#bilibili-player',
       '.bpx-player-container',
     ],
-    /** Roots that may host the fallback overlay. */
-    roots: [
-      '#bilibili-player',
-      '.bpx-player-container',
-      '.bilibili-player',
-    ],
     /**
-     * The wrapper around bilibili's own clock. Hiding the wrapper instead of
-     * the two clocks individually is what also removes the `/` divider that
-     * sits between them.
+     * The wrapper around bilibili's own clock. Our readout is placed *inside*
+     * this wrapper, in the slot the elapsed clock occupies, and the wrapper's
+     * original children (both clocks plus the `/` divider) are hidden. Leaving
+     * the wrapper itself in the layout is what keeps our readout positioned
+     * exactly where bilibili's own clock was.
      */
     timeBox: [
       '.bpx-player-ctrl-time',
@@ -346,44 +346,16 @@
   }
 
   /*
-   * Position stamping
-   * -----------------
-   * The fallback overlay is `position:absolute`, so it needs a positioned
-   * ancestor. bilibili's player container computes to `static`, so we have to
-   * make it `relative` first — and writing that as an INLINE style is
-   * destructive, because an inline style outranks the stylesheet. bilibili's
-   * "web fullscreen" (网页全屏) works by switching that very container to
-   * `position:fixed`, so a leftover inline `position:relative` silently
-   * disables it forever.
-   *
-   * Hence: record the previous value in an attribute, and undo the moment the
-   * overlay goes away.
+   * This script deliberately never writes an inline `position` (or any other
+   * layout property) onto a bilibili element. An earlier version did, to anchor
+   * a bottom-left overlay: it had to make the player container `relative`, but
+   * an inline style outranks the stylesheet, and bilibili's "web fullscreen"
+   * (网页全屏) works by switching that very container to `position:fixed` — so
+   * the leftover stamp silently disabled web fullscreen for good. The overlay
+   * is gone; the only property this script ever overrides on a bilibili
+   * element is `display`, and every such node is tagged with HIDDEN_ATTR so it
+   * can be restored exactly.
    */
-  function stampPosition(el) {
-    if (!el || !el.style) return;
-    // Browsers report `static` for an unstyled element; jsdom reports `''`
-    // (and so do a few embedded engines), so treat both as "not positioned".
-    const position = getComputedStyle(el).position;
-    if (position && position !== 'static') return;
-    if (!el.hasAttribute(POSITIONED_ATTR)) {
-      el.setAttribute(POSITIONED_ATTR, el.style.position || '');
-    }
-    el.style.position = 'relative';
-  }
-
-  function unstampPosition(el) {
-    if (!el || !el.style || !el.hasAttribute(POSITIONED_ATTR)) return;
-    const previous = el.getAttribute(POSITIONED_ATTR) || '';
-    if (previous) el.style.position = previous;
-    else el.style.removeProperty('position');
-    el.removeAttribute(POSITIONED_ATTR);
-  }
-
-  /** Belt and braces: undo stamps on elements we lost track of (re-renders). */
-  function unstampAllPositions() {
-    const marked = document.querySelectorAll('[' + POSITIONED_ATTR + ']');
-    for (let i = 0; i < marked.length; i++) unstampPosition(marked[i]);
-  }
 
   /**
    * Turn the current page URL into a timepoint link.
@@ -512,18 +484,15 @@
     durationEl: null,
     timeBox: null,      // the wrapper holding both native clocks
     dividerEl: null,    // the `/` between them (only when there is no wrapper)
-    badge: null,        // live-seconds readout (inline or overlay)
+    badge: null,        // live-seconds readout
     badgeAnchor: null,
-    overlay: null,
-    overlayRoot: null,
     lastText: null,
     lastTickAt: 0,
     frameHandle: null,
     framePending: false,
     flashTimer: 0,
-    warnedNoClock: false,  // so the "fell back to overlay" advice logs only once
-    missCount: 0,          // consecutive ticks with no resolvable clock node
-    everHadClock: false,   // have we ever resolved a native clock on this page?
+    /** Consecutive ticks with no resolvable clock node; gates the warning only. */
+    missCount: 0,
   };
 
   /* ------------------------------------------------------------------ *
@@ -542,7 +511,7 @@
       '  font-variant-numeric:tabular-nums;',
       '  color:inherit;opacity:.72;',
       '  cursor:pointer;user-select:none;white-space:nowrap;',
-      '  transition:opacity .15s ease,color .15s ease;',
+      '  transition:opacity .15s ease,color .15s ease,filter .15s ease;',
       '}',
       '.' + CLS_SEC + ':hover{opacity:1;color:#00aeec;}',
       '.' + CLS_SEC + '.' + CLS_FLASH + '{opacity:1;color:#00aeec;}',
@@ -558,17 +527,23 @@
       '  color:var(--bst-clock-color,inherit);',
       '  opacity:var(--bst-clock-opacity,1);',
       '}',
-      '.' + CLS_SEC + '.' + CLS_SOLO + ':hover{color:#00aeec;opacity:1;}',
-      '.' + CLS_SEC + '.' + CLS_SOLO + '.' + CLS_FLASH + '{color:#00aeec;opacity:1;}',
-      /* Fallback overlay: pinned above the control bar, bottom-left. */
-      '.' + CLS_SEC + '.' + CLS_OVERLAY + '{',
-      '  position:absolute;left:12px;bottom:52px;z-index:80;',
-      '  padding:2px 7px;border-radius:4px;',
-      '  background:rgba(0,0,0,.55);color:#fff;',
-      '  font-size:12px;opacity:.9;pointer-events:auto;',
+      /*
+       * Hover feedback is deliberately NOT a colour change. bilibili's own
+       * clock stays white and merely brightens when you point at it, so we do
+       * the same: lift the copied opacity to 1 and give it a small brightness
+       * boost. `color` is re-declared so the generic `.bst-sec:hover` blue
+       * above cannot leak in.
+       */
+      '.' + CLS_SEC + '.' + CLS_SOLO + ':hover{',
+      '  color:var(--bst-clock-color,inherit);',
+      '  opacity:1;filter:brightness(1.35);',
       '}',
-      '.' + CLS_SEC + '.' + CLS_OVERLAY + ':hover{opacity:1;color:#00aeec;}',
-      '.' + CLS_SEC + ' .' + CLS_SEC + '-hint{margin-left:4px;font-size:11px;opacity:.8;}',
+      /*
+       * The one place blue is still used: the ~1s "copied" confirmation after
+       * Alt+C. That is a transient state, not a hover, and it needs to be
+       * distinguishable from the hover brightening.
+       */
+      '.' + CLS_SEC + '.' + CLS_SOLO + '.' + CLS_FLASH + '{color:#00aeec;opacity:1;filter:none;}',
     ].join('\n');
     (document.head || document.documentElement).appendChild(style);
   }
@@ -604,7 +579,7 @@
    * `:hover` feedback still wins; the font metrics can safely be inline.
    */
   function syncNativeAppearance() {
-    if (!state.badge || state.badge === state.overlay) return;
+    if (!state.badge) return;
     const src = state.currentEl;
     if (!src || typeof getComputedStyle !== 'function') return;
     let cs = null;
@@ -653,24 +628,14 @@
     return true;
   }
 
-  function placeOverlayBadge() {
-    const root = queryFirst(SELECTORS.roots);
-    if (!root) return false;
-    if (state.overlay && state.overlay.isConnected && state.overlayRoot === root && state.badge === state.overlay) {
-      return true;
-    }
-    removeBadge();
-    removeOverlay();
-    stampPosition(root);
-    const el = makeBadge(CLS_OVERLAY, '未找到播放器时钟，已降级为悬浮显示。点击可切换显示样式。');
-    root.appendChild(el);
-    state.overlay = el;
-    state.overlayRoot = root;
-    state.badge = el;
-    state.badgeAnchor = null;
-    return true;
-  }
-
+  /**
+   * Remove every readout from the document, including ones we no longer track.
+   *
+   * Our badge lives *inside* bilibili's clock box, so if the player ever
+   * detaches that box and re-attaches the same element (rather than rebuilding
+   * the control bar from scratch), the stale badge rides back in with it and we
+   * would end up with two readouts. Sweeping by class makes that impossible.
+   */
   function removeBadge() {
     if (state.flashTimer) {
       clearTimeout(state.flashTimer);
@@ -680,27 +645,20 @@
     state.badge = null;
     state.badgeAnchor = null;
     state.lastText = null;
-  }
-
-  function removeOverlay() {
-    if (state.overlay && state.overlay.isConnected) state.overlay.remove();
-    // Never leave the container we made `relative` behind: an inline
-    // `position` outranks bilibili's own stylesheet and breaks web fullscreen.
-    unstampPosition(state.overlayRoot);
-    state.overlay = null;
-    state.overlayRoot = null;
+    const strays = document.querySelectorAll('.' + CLS_SEC);
+    for (let i = 0; i < strays.length; i++) {
+      if (strays[i].parentNode) strays[i].remove();
+    }
   }
 
   function teardown() {
     removeBadge();
-    removeOverlay();
-    unstampAllPositions();
     restoreNativeClocks();
     state.timeBox = null;
     state.dividerEl = null;
   }
 
-  /** (Re)attach the readouts to whatever player DOM currently exists. */
+  /** (Re)attach the readout to whatever player DOM currently exists. */
   function ensureInjected() {
     if (!config.enabled) {
       teardown();
@@ -723,45 +681,39 @@
        * 切回插件样式的落点；但既不显示自己的读数，也不去改它的 display。
        */
       removeBadge();
-      removeOverlay();
-      if (nodes.current) state.everHadClock = true;
+      state.missCount = 0;
       applyNativeVisibility();
       return true;
     }
 
-    if (nodes.current && nodes.current.parentNode) {
-      state.missCount = 0;
-      state.everHadClock = true;
-      if (state.warnedNoClock) {
-        state.warnedNoClock = false;
-        log('已找到 B 站原生时钟节点，读数改为内联显示。');
-      }
-      removeOverlay();
-      placeLiveBadge();
-    } else if (state.everHadClock && state.missCount < OVERLAY_AFTER_MISSES) {
+    if (!(nodes.current && nodes.current.parentNode)) {
       /*
-       * We have seen a clock on this page before, so its absence right now is
-       * almost certainly a transient: bilibili deletes and rebuilds the whole
-       * control bar when the quality changes or web-fullscreen is toggled.
-       * Falling back to the overlay here is what stamped `position:relative`
-       * onto the player container mid-transition and permanently broke web
-       * fullscreen. Wait for the rebuild instead.
+       * 找不到时钟节点时**什么都不显示**，也绝不碰播放器的布局。
+       *
+       * 早期版本会在这里降级成一个钉在播放器左下角的浮层读数，代价是必须给
+       * 播放器容器写内联 `position:relative` 当定位祖先。内联样式优先级高于
+       * 样式表，而 B 站的网页全屏恰恰是靠把同一个容器切成 `position:fixed`
+       * 实现的——一个残留的内联 `position` 会让网页全屏永久失效。这条降级
+       * 路径已整体删除，脚本从此不再写任何布局属性到 B 站元素上。
+       *
+       * 控制栏在切清晰度 / 进出全屏时会被整条重建，所以短暂 miss 是正常的，
+       * 提示信息等连续 miss 够久（约 3 秒）再打，避免首屏刷一堆吓人的日志。
        */
+      removeBadge();
       state.missCount += 1;
+      if (state.missCount === WARN_AFTER_MISSES) {
+        log(
+          '没找到 B 站原生的时间节点，暂时不显示读数（不会改动播放器布局）。\n' +
+          '若读数一直不出现，请在控制台运行下列命令，并把输出反馈给作者以补充精确选择器：\n' +
+          '  __biliSecTimepoint.resolveTimeNodes()\n' +
+          '  __biliSecTimepoint.guessTimeNodes()'
+        );
+      }
       return false;
-    } else if (!placeOverlayBadge()) {
-      // No clock node at all: degrade to a floating readout over the player.
-      return false;
-    } else if (!state.warnedNoClock) {
-      state.warnedNoClock = true;
-      log(
-        '没找到 B 站原生的时间节点，已降级为播放器左下角的浮层读数。\n' +
-        '请在控制台运行下列命令，并把输出反馈给作者以补充精确选择器：\n' +
-        '  __biliSecTimepoint.resolveTimeNodes()\n' +
-        '  __biliSecTimepoint.guessTimeNodes()'
-      );
     }
 
+    state.missCount = 0;
+    placeLiveBadge();
     applyNativeVisibility();
     update(true);
     return true;
@@ -1068,11 +1020,8 @@
       })
     );
     return {
-      overlayActive: !!document.querySelector('.' + CLS_SEC + '.' + CLS_OVERLAY),
-      inlineBadges: document.querySelectorAll('.' + CLS_SEC + ':not(.' + CLS_OVERLAY + ')').length,
+      readouts: document.querySelectorAll('.' + CLS_SEC).length,
       hiddenClocks: inventory('[' + HIDDEN_ATTR + ']', HIDDEN_ATTR),
-      repositionedRoots: inventory('[' + POSITIONED_ATTR + ']', POSITIONED_ATTR),
-      everHadClock: state.everHadClock,
       missCount: state.missCount,
     };
   }
@@ -1080,11 +1029,12 @@
   /**
    * Undo every change made to bilibili's own DOM, then report what was undone.
    * Escape hatch for "something on the player stopped working": run it and try
-   * the broken feature again. Note the next heartbeat may rebuild the overlay.
+   * the broken feature again. The next heartbeat will re-hide the native clocks
+   * if the script is still meant to be showing its readout, so switch the
+   * script off first if you want the revert to stick.
    */
   function revertDomMutations() {
     restoreNativeClocks();
-    unstampAllPositions();
     const inventory = describeMutations();
     log('已撤销对 B 站 DOM 的全部改动：', inventory);
     return inventory;
