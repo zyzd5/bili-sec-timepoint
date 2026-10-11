@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>bili-sec-timepoint — offline mock player</title>
+<!--
+  Offline harness for bili-sec-timepoint.user.js.
+
+  Why it exists: the script's selectors could not be verified against the live
+  bilibili page from the development sandbox, so this page reproduces the three
+  DOM shapes the script claims to handle, and lets a human confirm each one
+  visually in a normal browser.
+
+  Usage: open this file in any browser (no server needed), pick a local video,
+  then click a layout button. The userscript is loaded with a plain <script>
+  tag, so it runs in its "no userscript manager" mode: config falls back to
+  localStorage and clipboard falls back to navigator.clipboard / execCommand.
+-->
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 24px;
+    font: 14px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #14161a; color: #e6e8eb;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .hint { color: #9aa4b2; margin: 0 0 20px; max-width: 760px; }
+  .bar { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 16px; }
+  button {
+    font: inherit; padding: 6px 12px; border-radius: 6px; cursor: pointer;
+    border: 1px solid #3a4150; background: #1e232b; color: #e6e8eb;
+  }
+  button:hover { background: #262c36; }
+  button[aria-pressed="true"] { background: #2b6cb0; border-color: #2b6cb0; }
+  video { width: 100%; max-width: 760px; background: #000; display: block; }
+
+  /* ---- mock bpx control bar ------------------------------------------- */
+  .bpx-player-container { position: relative; max-width: 760px; background: #000; }
+  .bpx-player-control-bottom {
+    display: flex; align-items: center; gap: 12px;
+    padding: 8px 12px; background: rgba(20,22,26,.92);
+  }
+  .bpx-player-ctrl-time { display: flex; align-items: center; gap: 4px; font-variant-numeric: tabular-nums; }
+  .bpx-player-ctrl-time-label { display: flex; align-items: center; gap: 4px; }
+
+  /* The readout the userscript injects must not disturb the native layout, so
+     give the native clock the same styling bilibili uses: a bright white
+     elapsed clock and a dimmed duration. The script reads these straight off
+     the live element, so the readout should come out white and undimmed too. */
+  .bpx-player-ctrl-time-current { color: #fff; opacity: .9; }
+  .bpx-player-ctrl-time-duration { color: #fff; opacity: .55; }
+  .bpx-player-ctrl-time-divider { color: #fff; opacity: .55; }
+  .weird-clock-elapsed { color: #fff; opacity: .9; }
+  .weird-clock-total { color: #fff; opacity: .55; }
+  .weird-clock-sep { color: #fff; opacity: .55; }
+  .bst-sec { color: #fff; }
+
+  .panel { max-width: 760px; margin-top: 20px; }
+  #log {
+    background: #0f1115; border: 1px solid #2a303a; border-radius: 6px;
+    padding: 12px; white-space: pre-wrap; word-break: break-all;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+    max-height: 240px; overflow: auto;
+  }
+  .file-row { margin-bottom: 16px; }
+</style>
+</head>
+<body>
+
+<h1>mock player — bili-sec-timepoint</h1>
+<p class="hint">
+  选择本地视频，然后切换下方三种布局，确认读数出现在正确位置。
+  "modern" = 真实 bpx 类名；"renamed" = 类名被改掉，靠文本启发式发现；“bare” = 完全没有时钟节点，走浮层兜底。
+  下方两个按钮可以对比<strong>插件样式（只有剩余秒数）/ B 站默认样式</strong>，以及<strong>剩余 / 已播</strong>。
+  <br>
+  插件样式下<strong>直接点击时间点本身</strong>即可在这两种样式之间来回切换 —— 页面里的模拟时钟也接了同样的处理器，
+  点击它会打印一行日志，用来确认脚本确实把 B 站原本的“点击输入时间点”给拦下来了。
+</p>
+
+<div class="file-row">
+  <input type="file" id="picker" accept="video/*">
+</div>
+
+<div class="bar">
+  <button data-fixture="modern" aria-pressed="true">modern (bpx 类名)</button>
+  <button data-fixture="renamed" aria-pressed="false">renamed (启发式)</button>
+  <button data-fixture="bare" aria-pressed="false">bare (浮层兜底)</button>
+</div>
+
+<div class="bar">
+  <button id="toggle-style" aria-pressed="true">样式：插件（只有剩余秒数）</button>
+  <button id="toggle-mode" aria-pressed="true">读数：剩余秒数</button>
+</div>
+
+<div class="bpx-player-container" id="player">
+  <video id="video" controls playsinline></video>
+  <div class="bpx-player-control-bottom" id="controls"></div>
+</div>
+
+<div class="panel">
+  <div class="bar">
+    <button id="probe">检测 resolveTimeNodes()</button>
+    <button id="copy">复制当前时间点</button>
+    <button id="rerender">模拟播放器重渲染</button>
+  </div>
+  <div id="log">ready.</div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  var video = document.getElementById('video');
+  var controls = document.getElementById('controls');
+  var logEl = document.getElementById('log');
+
+  function log(message) {
+    logEl.textContent = message + '\n' + logEl.textContent;
+  }
+
+  /* -- the three control-bar shapes ----------------------------------- */
+
+  var FIXTURES = {
+    // Today's bilibili markup, with the exact class names the script looks for.
+    modern:
+      '<div class="bpx-player-ctrl-time">' +
+        '<span class="bpx-player-ctrl-time-current">00:00</span>' +
+        '<span class="bpx-player-ctrl-time-divider">/</span>' +
+        '<span class="bpx-player-ctrl-time-duration">00:00</span>' +
+      '</div>',
+
+    // Same structure, but every class renamed: only the text heuristic can
+    // find these, which is exactly what we want to exercise.
+    renamed:
+      '<div class="weird-controls-bottom">' +
+        '<span class="weird-clock-elapsed">00:00</span>' +
+        '<span class="weird-clock-sep">/</span>' +
+        '<span class="weird-clock-total">00:00</span>' +
+      '</div>',
+
+    // No clock at all: the script must fall back to a floating overlay.
+    bare: '',
+  };
+
+  function mountFixture(name) {
+    controls.innerHTML = FIXTURES[name];
+    log('mounted fixture: ' + name);
+    var api = window.__biliSecTimepoint;
+    if (!api) { return; }
+    api.teardown();
+    /*
+     * A player that HAS had a clock must miss several heartbeats in a row before
+     * the script is willing to conclude "this player has no clock" — that grace
+     * period is what keeps a control-bar rebuild from stamping a stray inline
+     * `position:relative` onto the player (which broke web fullscreen once).
+     * Rather than make the tester wait ~3 s, replay the misses immediately.
+     */
+    for (var i = 0; i < 7; i++) { api.ensureInjected(); }
+    api.update(true);
+  }
+
+  Array.prototype.forEach.call(
+    document.querySelectorAll('[data-fixture]'),
+    function (button) {
+      button.addEventListener('click', function () {
+        Array.prototype.forEach.call(
+          document.querySelectorAll('[data-fixture]'),
+          function (b) { b.setAttribute('aria-pressed', String(b === button)); }
+        );
+        mountFixture(button.dataset.fixture);
+      });
+    }
+  );
+
+  /* -- keep the native clock text in sync with the video --------------- */
+
+  function fmt(sec) {
+    if (!isFinite(sec) || sec < 0) sec = 0;
+    var total = Math.floor(sec);
+    var h = Math.floor(total / 3600);
+    var m = Math.floor((total % 3600) / 60);
+    var s = total % 60;
+    function pad(n) { return (n < 10 ? '0' : '') + n; }
+    return h > 0 ? h + ':' + pad(m) + ':' + pad(s) : pad(m) + ':' + pad(s);
+  }
+
+  function syncClock() {
+    var elapsed = controls.querySelector(
+      '.bpx-player-ctrl-time-current, .weird-clock-elapsed'
+    );
+    var total = controls.querySelector(
+      '.bpx-player-ctrl-time-duration, .weird-clock-total'
+    );
+    if (elapsed) elapsed.textContent = fmt(video.currentTime);
+    if (total) total.textContent = fmt(video.duration);
+  }
+
+  video.addEventListener('timeupdate', syncClock);
+  video.addEventListener('loadedmetadata', function () {
+    syncClock();
+    log('loaded: duration=' + video.duration.toFixed(3) + 's');
+  });
+
+  /* -- debug buttons --------------------------------------------------- */
+
+  document.getElementById('probe').addEventListener('click', function () {
+    var api = window.__biliSecTimepoint;
+    if (!api) { log('userscript not loaded'); return; }
+    var nodes = api.resolveTimeNodes();
+    var box = api.resolveTimeBox();
+    var guessed = api.guessTimeNodes();
+    log(
+      'style             -> ' + api.config.style +
+      '  (mode=' + api.config.mode + ', precision=' + api.config.precision +
+      ', clickToToggle=' + api.config.clickToToggle + ')\n' +
+      'readoutSeconds()  -> ' + api.readoutSeconds(video) + '\n' +
+      'resolveTimeBox()  -> ' + (box ? box.className || box.tagName : 'null') + '\n' +
+      'resolveTimeNodes() -> ' +
+      (nodes.current ? nodes.current.className || nodes.current.tagName : 'null') + ' / ' +
+      (nodes.duration ? nodes.duration.className || nodes.duration.tagName : 'null') + '\n' +
+      'divider element   -> ' +
+      (api.resolveDividerEl(nodes.current)
+        ? (api.resolveDividerEl(nodes.current).className || api.resolveDividerEl(nodes.current).tagName)
+        : 'null') + '\n' +
+      'guessTimeNodes()  -> ' + (guessed
+        ? 'current=' + (guessed.current.className || guessed.current.tagName) +
+          ', duration=' + (guessed.duration ? guessed.duration.className || guessed.duration.tagName : 'null')
+        : 'null (nothing clock-like found)') + '\n' +
+      'overlay in use    -> ' + !!document.querySelector('.bst-sec--overlay') + '\n' +
+      'our readout style -> ' + (function () {
+        var badge = document.querySelector('.bst-sec');
+        if (!badge) { return 'no readout'; }
+        return 'colour=' + (badge.style.getPropertyValue('--bst-clock-color') || '(inherited)') +
+               ' opacity=' + (badge.style.getPropertyValue('--bst-clock-opacity') || '(default)') +
+               ' font=' + (badge.style.fontSize || '(inherited)');
+      })() + '\n' +
+      'DOM mutations     -> ' + JSON.stringify(api.describeMutations())
+    );
+  });
+
+  document.getElementById('toggle-style').addEventListener('click', function () {
+    var api = window.__biliSecTimepoint;
+    if (!api) { log('userscript not loaded'); return; }
+    api.toggleStyle();
+    syncStyleButton();
+  });
+
+  function syncStyleButton() {
+    var api = window.__biliSecTimepoint;
+    var button = document.getElementById('toggle-style');
+    if (!api || !button) return;
+    var plugin = api.config.style === 'plugin';
+    button.textContent = plugin ? '样式：插件（只有剩余秒数）' : '样式：B 站默认';
+    button.setAttribute('aria-pressed', String(plugin));
+  }
+
+  document.getElementById('toggle-mode').addEventListener('click', function () {
+    var api = window.__biliSecTimepoint;
+    if (!api) { log('userscript not loaded'); return; }
+    api.config.mode = api.config.mode === 'remaining' ? 'elapsed' : 'remaining';
+    api.applyConfig();
+    var remaining = api.config.mode === 'remaining';
+    this.textContent = remaining ? '读数：剩余秒数' : '读数：已播秒数';
+    this.setAttribute('aria-pressed', String(remaining));
+    log('mode -> ' + api.config.mode);
+  });
+
+  // Stands in for bilibili's "click the clock to type a time" editor: if the
+  // userscript is doing its job this must never fire while clickToToggle is on.
+  // Bound on `document` rather than on the control bar, because the script's own
+  // capture-phase listener calls stopPropagation() and the event would never
+  // descend to an ancestor inside the player.
+  document.addEventListener('click', function (event) {
+    var target = event.target;
+    var clock = target && target.closest && target.closest(
+      '.bpx-player-ctrl-time-current, .weird-clock-elapsed'
+    );
+    if (clock) {
+      log('!! bilibili\'s own click handler received the event — the script did not swallow it');
+      return;
+    }
+    syncStyleButton();
+  });
+
+  document.getElementById('copy').addEventListener('click', function () {
+    var api = window.__biliSecTimepoint;
+    if (!api) { log('userscript not loaded'); return; }
+    api.copyCurrentTimepoint();
+    log('copyCurrentTimepoint() -> ' + api.buildTimepointUrl(video.currentTime, location.href));
+  });
+
+  document.getElementById('rerender').addEventListener('click', function () {
+    var active = document.querySelector('[data-fixture][aria-pressed="true"]');
+    var name = active ? active.dataset.fixture : 'modern';
+    mountFixture(name);
+    log('re-mounted; waiting for the 500 ms heartbeat to re-attach');
+  });
+
+  document.getElementById('picker').addEventListener('change', function (event) {
+    var file = event.target.files && event.target.files[0];
+    if (!file) return;
+    video.src = URL.createObjectURL(file);
+    log('picked: ' + file.name);
+  });
+
+  // Expose the current video for the console.
+  window.__mockVideo = video;
+})();
+</script>
+
+<!-- The deliverable, loaded verbatim. -->
+<script src="../bili-sec-timepoint.user.js"></script>
+
+</body>
+</html>
