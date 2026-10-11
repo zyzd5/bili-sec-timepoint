@@ -94,6 +94,19 @@ npm test
 
 > **为什么装依赖要带 `--cache ./.npm-cache`**：如果系统 npm 缓存目录不在当前工作区、且当前环境对它有写限制，默认 `npm install` 会报 `EPERM`。把缓存指到工作区内即可。已经能正常 `npm install` 的环境直接 `npm install` 也行。
 
+### 对着真实页面验证
+
+jsdom 证明的是脚本的**逻辑**，证明不了 B 站真实页面上的类名和事件是否如脚本所料。这一半由 `test/live-verify.mjs` 负责：它用 DevTools Protocol 驱动无头 Chrome，打开一个**真实的**视频页，把脚本注入进去，检查它找到了什么，再用**真实的合成鼠标事件**点一下读数。零依赖（只用 Node 自带的 `fetch` 和 `WebSocket`），全部检查通过时退出码为 0，所以也能当回归门禁。
+
+```bash
+node test/live-verify.mjs                                  # 默认跑 BV1GJ411x7h7
+node test/live-verify.mjs https://www.bilibili.com/video/BV.../ --out=.tmp
+```
+
+它会打印一份 JSON 报告，并在 `--out`（默认 `.tmp/`）下留两张截图：插件样式一张、切到 B 站默认样式一张。目前 14 项检查全部通过——读数确实落在 `.bpx-player-ctrl-time` 内部、颜色和字号与原生时钟逐项相同、播放器上没有任何内联 `position`、真实鼠标点击能让样式切换、页面零 JS 报错。
+
+> **这个脚本需要放宽的文件沙箱权限。** 在 macOS 上，如果当前沙箱只允许写工作区，Chrome 会立刻以 exit 133 退出并报 `Failed to initialize sandbox`——因为 Chrome 自己的进程沙箱和它的 Crashpad 上报进程都需要写 `~/Library/Application Support/Google/Chrome/Crashpad/`。**这是文件系统权限问题，不是 macOS 隐私设置**：给宿主 App 开"完全磁盘访问权限"不会改变任何东西。要么放宽运行这个脚本时的沙箱，要么跳过它——`npm test` 不需要任何特殊权限。
+
 ## 装了没反应？按这个顺序查
 
 **第一步：确认脚本到底跑了没有。** 打开 F12 控制台，过滤 `bili-sec-timepoint`。正常情况下一定有一行：
@@ -187,8 +200,9 @@ __biliSecTimepoint.describeMutations()
 | 路径 | 说明 |
 | --- | --- |
 | `bili-sec-timepoint.user.js` | 脚本本体，单文件、无构建步骤、无外部依赖 |
-| `test/run-tests.mjs` | jsdom 测试套件（169 条断言） |
-| `package.json` | 只有 `npm test` 和 jsdom 这一个 devDependency |
+| `test/run-tests.mjs` | jsdom 测试套件（169 条断言），`npm test` |
+| `test/live-verify.mjs` | 真机验证：无头 Chrome 打开真实 B 站页面注入脚本并点击读数，`npm run verify:live` |
+| `package.json` | 只有 `npm test` / `npm run verify:live` 和 jsdom 这一个 devDependency |
 
 ## License
 

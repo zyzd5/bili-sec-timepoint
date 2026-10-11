@@ -1,10 +1,11 @@
 {
   "name": "bili-sec-timepoint",
-  "version": "1.0.0",
+  "version": "1.5.0",
   "private": true,
-  "description": "Userscript: show exact seconds on the bilibili player clock and copy ?t= timepoint links.",
+  "description": "Userscript: replace the bilibili player clock with the exact number of seconds left.",
   "scripts": {
-    "test": "node test/run-tests.mjs"
+    "test": "node test/run-tests.mjs",
+    "verify:live": "node test/live-verify.mjs"
   },
   "devDependencies": {
     "jsdom": "^26.0.0"
