@@ -1,6 +1,6 @@
 {
   "name": "bili-sec-timepoint",
-  "version": "1.5.0",
+  "version": "1.5.1",
   "private": true,
   "description": "Userscript: replace the bilibili player clock with the exact number of seconds left.",
   "scripts": {

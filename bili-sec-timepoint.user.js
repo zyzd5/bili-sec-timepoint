@@ -2,7 +2,7 @@
 // @name         Bilibili 秒级时间点 (bili-sec-timepoint)
 // @name:en      Bilibili Second Timepoint
 // @namespace    https://github.com/local/bili-sec-timepoint
-// @version      1.5.0
+// @version      1.5.1
 // @description  把 B 站播放器的时间区域改成只显示「距离视频结束还剩多少秒」；点击时间点即可在插件样式与 B 站默认样式之间切换。
 // @description:en  Replace the bilibili player clock with a plain seconds-remaining countdown. Click the timepoint to switch back to bilibili's own clock.
 // @author       bili-sec-timepoint
@@ -53,9 +53,17 @@
 
   const STORE_KEY = 'bst:config';
   const CONFIG_VERSION = 3;             // bump to reset display keys on upgrade
-  const VERSION = '1.5.0';
+  const VERSION = '1.5.1';
   const HEARTBEAT_MS = 500;
   const TICK_MIN_INTERVAL_MS = 80;      // throttle for the per-frame update loop
+  /*
+   * After the readout is first attached, watch bilibili's clock styling at
+   * frame cadence instead of waiting for a heartbeat. The player's stylesheet
+   * lands in several passes and its control bar is rescaled as the layout
+   * settles, so the value we read on attach can be a placeholder — and the
+   * wrong font is most visible in exactly those first moments.
+   */
+  const APPEARANCE_SETTLE_MS = 3000;
 
   /** Leaf text that looks like a player clock, e.g. `02:31` or `1:02:31`. */
   const TIME_TEXT_RE = /^\s*\d{1,3}:\d{2}(?::\d{2})?\s*$/;
@@ -428,6 +436,10 @@
     dividerEl: null,    // the `/` between them (only when there is no wrapper)
     badge: null,        // live-seconds readout
     badgeAnchor: null,
+    /** Native styling we last copied onto the readout; see syncNativeAppearance(). */
+    syncedStyle: null,
+    /** Timestamp until which we re-check that styling every frame, not per heartbeat. */
+    settleUntil: 0,
     lastText: null,
     lastTickAt: 0,
     frameHandle: null,
@@ -509,6 +521,14 @@
    * Reading it off the live element instead of hard-coding a hex value keeps
    * us in step with whatever skin / theme / fullscreen scaling is in effect.
    *
+   * Those values are *not* stable. bilibili injects its player stylesheet in
+   * several passes and rescales the control bar as the layout lands, so a
+   * reading taken the moment we attach can be a placeholder it replaces a
+   * moment later. Snapshotting once made that placeholder stick: the readout
+   * kept the wrong font until the next resize or style toggle happened to
+   * force another read. So compare against what we last copied and refresh
+   * whenever bilibili's own value moves; the heartbeat drives this.
+   *
    * Colour and opacity go in as custom properties so the stylesheet's
    * `:hover` feedback still wins; the font metrics can safely be inline.
    */
@@ -523,13 +543,39 @@
       return;
     }
     if (!cs) return;
+    // A detached or not-yet-rendered source reports nothing at all. Keep the
+    // last good reading instead of blanking the readout out.
+    if (!cs.fontSize) return;
+
+    const next = {
+      color: cs.color || '',
+      opacity: cs.opacity || '',
+      fontSize: cs.fontSize,
+      fontWeight: cs.fontWeight || '',
+      fontFamily: cs.fontFamily || '',
+      lineHeight: cs.lineHeight || '',
+    };
+    const prev = state.syncedStyle;
+    if (
+      prev &&
+      prev.color === next.color &&
+      prev.opacity === next.opacity &&
+      prev.fontSize === next.fontSize &&
+      prev.fontWeight === next.fontWeight &&
+      prev.fontFamily === next.fontFamily &&
+      prev.lineHeight === next.lineHeight
+    ) {
+      return;
+    }
+    state.syncedStyle = next;
+
     const s = state.badge.style;
-    if (cs.color) s.setProperty('--bst-clock-color', cs.color);
-    if (cs.opacity) s.setProperty('--bst-clock-opacity', cs.opacity);
-    if (cs.fontSize) s.fontSize = cs.fontSize;
-    if (cs.fontWeight) s.fontWeight = cs.fontWeight;
-    if (cs.fontFamily) s.fontFamily = cs.fontFamily;
-    if (cs.lineHeight) s.lineHeight = cs.lineHeight;
+    if (next.color) s.setProperty('--bst-clock-color', next.color);
+    if (next.opacity) s.setProperty('--bst-clock-opacity', next.opacity);
+    s.fontSize = next.fontSize;
+    if (next.fontWeight) s.fontWeight = next.fontWeight;
+    if (next.fontFamily) s.fontFamily = next.fontFamily;
+    if (next.lineHeight) s.lineHeight = next.lineHeight;
   }
 
   /** Re-sync after bilibili rescales its control bar (fullscreen / resize). */
@@ -558,6 +604,7 @@
     else if (anchor.parentNode) anchor.insertAdjacentElement('afterend', state.badge);
     else anchor.appendChild(state.badge);
     state.badgeAnchor = anchor;
+    state.settleUntil = Date.now() + APPEARANCE_SETTLE_MS;
     syncNativeAppearance();
     return true;
   }
@@ -574,6 +621,7 @@
     if (state.badge && state.badge.isConnected) state.badge.remove();
     state.badge = null;
     state.badgeAnchor = null;
+    state.syncedStyle = null;
     state.lastText = null;
     const strays = document.querySelectorAll('.' + CLS_SEC);
     for (let i = 0; i < strays.length; i++) {
@@ -659,6 +707,7 @@
     state.video = video;
 
     if (state.badge && state.badge.isConnected) {
+      if (Date.now() < state.settleUntil) syncNativeAppearance();
       const text = formatSeconds(readoutSeconds(video), config.precision);
       if (force || text !== state.lastText) {
         state.badge.textContent = text;
@@ -837,6 +886,14 @@
       ensureInjected();
       return;
     }
+    /*
+     * Everything we depend on is still in place, so there is nothing to
+     * re-inject — but bilibili may have restyled its clock since the last
+     * tick (the player's stylesheet lands in several passes, and the control
+     * bar is rescaled as the layout settles). Cheap enough to re-check here,
+     * and it only writes when a value actually moved.
+     */
+    syncNativeAppearance();
     const video = resolveVideo();
     if (video && video !== state.video) {
       state.video = video;

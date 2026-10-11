@@ -305,6 +305,48 @@ check(
 );
 check('the player elements carry no hidden marker', !after.playerHasHiddenMark);
 
+// --- Step 3b: the borrowed look must be tracked, not snapshotted ----------
+/*
+ * Regression guard. bilibili injects its player stylesheet in several passes
+ * and rescales the control bar as the layout lands, so the value present when
+ * the readout attaches can be a placeholder. Snapshotting it once left the
+ * readout on a stale font until the user happened to toggle the style.
+ */
+await evaluate(`(() => {
+  const cur = document.querySelector('.bpx-player-ctrl-time-current');
+  cur.dataset.bstProbeOld = cur.style.fontSize || '';
+  cur.style.fontSize = '23px';
+  cur.style.fontWeight = '700';
+  return 1;
+})()`);
+await sleep(900); // one heartbeat interval, plus slack
+const followed = await evaluate(`(() => {
+  const b = document.querySelector('.bst-sec');
+  const cur = document.querySelector('.bpx-player-ctrl-time-current');
+  return {
+    badgeFont: b ? getComputedStyle(b).fontSize : null,
+    nativeFont: cur ? getComputedStyle(cur).fontSize : null,
+    badgeWeight: b ? getComputedStyle(b).fontWeight : null,
+    nativeWeight: cur ? getComputedStyle(cur).fontWeight : null,
+  };
+})()`);
+report.steps.appearanceFollow = followed;
+check(
+  'the readout tracks the native clock instead of snapshotting it',
+  followed.badgeFont === followed.nativeFont &&
+    followed.nativeFont === '23px' &&
+    followed.badgeWeight === followed.nativeWeight,
+  `badge ${followed.badgeFont}/${followed.badgeWeight} vs native ${followed.nativeFont}/${followed.nativeWeight}`,
+);
+// Put it back so the click steps below work with the normal geometry.
+await evaluate(`(() => {
+  const cur = document.querySelector('.bpx-player-ctrl-time-current');
+  cur.style.fontSize = cur.dataset.bstProbeOld;
+  cur.style.fontWeight = '';
+  return 1;
+})()`);
+await sleep(900);
+
 // --- Step 4: click the readout with a real mouse event --------------------
 const rect = await evaluate(`(() => {
   const b = document.querySelector('.bst-sec');

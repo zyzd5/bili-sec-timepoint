@@ -298,6 +298,34 @@ async function testModern() {
   check('font size copied too', badge.style.fontSize, '22px');
   check('font weight copied too', badge.style.fontWeight, '600');
 
+  /*
+   * The reading is not final. bilibili injects its player stylesheet in
+   * several passes and rescales the control bar as the layout settles, so the
+   * value present the moment we attach can be a placeholder. Snapshotting it
+   * once left the readout stuck on that placeholder — the wrong font until the
+   * next resize or style toggle forced another read.
+   */
+  group('modern player: the borrowed look is re-checked, not snapshotted');
+  nativeCurrent.style.fontSize = '17px';
+  nativeCurrent.style.fontWeight = '500';
+  t.api.heartbeat();
+  check('font size follows a later change on the native clock', badge.style.fontSize, '17px');
+  check('font weight follows too', badge.style.fontWeight, '500');
+
+  group('modern player: the frame loop re-checks it while the layout settles');
+  nativeCurrent.style.fontSize = '19px';
+  t.api.state.settleUntil = Date.now() + 1000;
+  t.api.update(false);
+  check('the settling window catches it without waiting for a heartbeat', badge.style.fontSize, '19px');
+  t.api.state.settleUntil = 0;
+
+  group('modern player: a detached clock does not blank the borrowed look');
+  const realCurrent = t.api.state.currentEl;
+  t.api.state.currentEl = t.doc.createElement('span');
+  t.api.syncNativeAppearance();
+  check('the last good font size is kept', badge.style.fontSize, '19px');
+  t.api.state.currentEl = realCurrent;
+
   group('modern player: switching back to the default style');
   t.api.config.style = 'native';
   t.api.applyConfig();
@@ -315,8 +343,15 @@ async function testModern() {
   t.api.applyConfig();
   check('all readouts removed', t.doc.querySelectorAll('.bst-sec').length, 0);
   check('native clock is back after disabling', nativeCurrent.style.display, '');
+  /*
+   * A rebuilt readout must read the clock again rather than reuse the copy
+   * cached for the previous one — that cache is what made the stale value
+   * survive a style toggle.
+   */
+  nativeCurrent.style.fontSize = '23px';
   t.api.config.enabled = true;
   t.api.applyConfig();
+  check('the rebuilt readout re-read the clock', badgeOf(t.doc).style.fontSize, '23px');
 
   group('modern player: clicking the time point toggles the style');
   // Re-query: the groups above cycled the master switch, which tears the
@@ -502,7 +537,7 @@ async function testBare() {
     'a startup banner proves the script ran at all',
     t.logs.some((l) => l.indexOf('[bili-sec-timepoint]') === 0)
   );
-  checkThat('the banner reports the version', t.logs.some((l) => l.indexOf('v1.5.0') !== -1));
+  checkThat('the banner reports the version', t.logs.some((l) => l.indexOf('v1.5.1') !== -1));
 
   group('bare player: recovery when a clock finally shows up');
   // Bilibili renders the control bar a moment after the video element appears,
