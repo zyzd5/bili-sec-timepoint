@@ -152,7 +152,19 @@ __biliSecTimepoint.describeMutations()
 
 ## 已知限制
 
-- **选择器未经真实页面验证。** 脚本的开发环境无法启动无头浏览器，也无法访问 B 站前端渲染后的控制栏 DOM，所以上面的类名和启发式是依据公开的播放器结构写的，理论上覆盖了三代类名，但**没有在线上页面逐条核对过**。所以脚本在任何一层都可能落空——落空时的表现是**读数不出现**（而不是显示一个位置可能不对的浮层），并在控制台给出提示。
+- **主选择器已在真实页面上逐条核对过。** 用无头 Chrome 打开真实的 B 站视频页，从渲染后的 DOM 里抓到的结构是：
+
+  ```html
+  <div class="bpx-player-ctrl-btn bpx-player-ctrl-time">
+    <div class="bpx-player-ctrl-time-label">
+      <span class="bpx-player-ctrl-time-current">00:00</span>
+      <span class="bpx-player-ctrl-time-divide">/</span>
+      <span class="bpx-player-ctrl-time-duration">06:29</span>
+    </div>
+  </div>
+  ```
+
+  也就是说 `SELECTORS.timeBox` / `SELECTORS.current` / `SELECTORS.duration` 三条首选选择器全部命中；读数被放进 `.bpx-player-ctrl-time` 内部，颜色（`rgba(255,255,255,0.8)`）和字号（`12px`）与原生时钟逐项一致，播放器元素上没有留下任何内联 `position`。备份选择器和启发式仍属于兜底路径，没有在线上逐条核对——落空时的表现是**读数不出现**（而不是显示一个位置可能不对的浮层），并在控制台给出提示。
 - 如果在你的浏览器里读数没出现、或位置不对，请在控制台运行：
 
   ```js
@@ -163,7 +175,7 @@ __biliSecTimepoint.describeMutations()
   ```
 
   `resolveTimeBox()` 返回元素或 `null`；`resolveTimeNodes()` 和 `guessTimeNodes()` 返回 `{ current, duration }` 或 `null`。据此可以补一条精确选择器到 `SELECTORS.timeBox` / `SELECTORS.current` / `SELECTORS.duration`。
-- **`.bpx-player-ctrl-time` 这个类名同样没在真实页面上核对过。** 它是"整个时间区域"的猜测值；如果猜错了，脚本会退化成分别隐藏两个时钟和中间的 `/`——效果一样，只是读数落在区域旁边而不是里面，位置可能略有偏差（`describeMutations().hiddenClocks` 会显示两条时钟加一条 `/`）。
+- **`.bpx-player-ctrl-time` 已确认就是"整个时间区域"。** 它同时带 `bpx-player-ctrl-btn` 类，内部是 `.bpx-player-ctrl-time-label` 包着 current / divide / duration 三个 `span`，另外还藏着一个**本来就已 `display:none`** 的 `<input class="bpx-player-ctrl-time-seek">`。脚本隐藏的是这个盒子的子元素而不是盒子本身，所以读数能沿用盒子的内边距和垂直居中；还原时每个子元素恢复成它**原本的内联值**（那个 input 会恢复成 `none`，不会被误显形）。`describeMutations().hiddenClocks` 因此会列出 label 和这个 input 两条。
 - **读数的外观是从原生时钟上"抄"来的。** 如果 B 站某天用图片或伪元素来画时钟，`getComputedStyle()` 读不到可抄的颜色，读数就会退回 CSS 继承的颜色。在控制台运行 `__biliSecTimepoint.syncNativeAppearance()` 后可以直接读 `__biliSecTimepoint.state.badge.style.getPropertyValue('--bst-clock-color')` 看抄到了什么。
 - **被脚本接管的点击不会再传给 B 站。** 也就是说装了脚本之后，点击时间区域不会弹出"输入时间跳转"。想要那个功能就在菜单里关掉「点击时间点切换样式」。
 - **小数位数的四舍五入是二进制浮点行为。** 读数用 `toFixed`，在恰好落在 `.x5` 边界上的值（例如 65.05）会向下取整。这是有意为之：结果可预测、不引入 epsilon 修正；而且这种值在播放中只会出现一瞬。

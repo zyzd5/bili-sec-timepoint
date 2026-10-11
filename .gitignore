@@ -3,3 +3,7 @@ node_modules/
 
 .DS_Store
 *.log
+
+# 本机临时产物（无头 Chrome 的 profile、调试脚本与截图）
+.tmp/
+.chrome-profile/
