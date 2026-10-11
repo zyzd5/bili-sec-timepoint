@@ -91,7 +91,11 @@ const PLAYER_BARE = `
  * Boot a jsdom window with the given player markup and execute the userscript.
  * Returns the window plus the test-facing handles we need.
  */
-function boot(html, { url = 'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2', media = {} } = {}) {
+function boot(html, {
+  url = 'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2',
+  media = {},
+  stored = null,   // raw value the GM store hands back for the config key
+} = {}) {
   const dom = new JSDOM(`<!doctype html><html><head></head><body>${html}</body></html>`, {
     url,
     runScripts: 'dangerously',
@@ -102,10 +106,8 @@ function boot(html, { url = 'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2', 
   window.addEventListener('error', (e) => errors.push(String(e.message || e)));
 
   // --- GM_* stubs -------------------------------------------------
-  const clipboard = [];
   const menus = [];
-  window.GM_setClipboard = (text) => { clipboard.push(text); };
-  window.GM_getValue = (_key, fallback) => fallback;
+  window.GM_getValue = (_key, fallback) => (stored === null ? fallback : stored);
   window.GM_setValue = () => {};
   window.GM_registerMenuCommand = (label) => { menus.push(label); return menus.length; };
   window.GM_unregisterMenuCommand = () => {};
@@ -149,10 +151,10 @@ function boot(html, { url = 'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2', 
     window.dispatchEvent(new window.Event('DOMContentLoaded'));
   }
 
-  return { dom, window, doc: window.document, api, clipboard, menus, mediaState, video, errors, logs };
+  return { dom, window, doc: window.document, api, menus, mediaState, video, errors, logs };
 }
 
-/** Let pending microtasks (promise chains in copyText) settle. */
+/** Let the script's event handlers finish before asserting on their effects. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 const badgeOf = (doc, extra = '') => doc.querySelector('.bst-sec' + extra);
@@ -169,6 +171,7 @@ function testHelpers(api) {
   check('guessTimeNodes is callable', typeof api.guessTimeNodes, 'function');
   check('readoutSeconds is callable', typeof api.readoutSeconds, 'function');
   check('toggleStyle is callable', typeof api.toggleStyle, 'function');
+  check('but the removed copy helper is not exposed', typeof api.buildTimepointUrl, 'undefined');
 
   group('formatSeconds');
   check('1 decimal', api.formatSeconds(2.44, 1), '2.4s');
@@ -194,33 +197,6 @@ function testHelpers(api) {
     Number.isNaN(api.readoutSeconds({ currentTime: 10, duration: NaN }))
   );
   checkThat('no video yields NaN', Number.isNaN(api.readoutSeconds(null)));
-
-  group('buildTimepointUrl');
-  check(
-    'preserves p and writes t',
-    api.buildTimepointUrl(2.4, 'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2'),
-    'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2&t=2'
-  );
-  check(
-    'floors fractional seconds',
-    api.buildTimepointUrl(3661.99, 'https://www.bilibili.com/video/BV1xx/'),
-    'https://www.bilibili.com/video/BV1xx/?t=3661'
-  );
-  check(
-    'clamps negatives to zero',
-    api.buildTimepointUrl(-5, 'https://www.bilibili.com/video/BV1xx/'),
-    'https://www.bilibili.com/video/BV1xx/?t=0'
-  );
-  check(
-    'drops the hash',
-    api.buildTimepointUrl(9, 'https://www.bilibili.com/video/BV1xx/#reply'),
-    'https://www.bilibili.com/video/BV1xx/?t=9'
-  );
-  check(
-    'replaces an existing t',
-    api.buildTimepointUrl(9, 'https://www.bilibili.com/video/BV1xx/?t=120'),
-    'https://www.bilibili.com/video/BV1xx/?t=9'
-  );
 
   group('guessTimeNodes leaves non-clock text alone');
   checkThat('regex rejects the divide token', !/^\s*\d{1,3}:\d{2}(?::\d{2})?\s*$/.test('/'));
@@ -254,9 +230,8 @@ async function testModern() {
   group('modern player: hover brightens instead of turning blue');
   /*
    * bilibili's own clock stays white and just brightens under the cursor, so
-   * the plugin readout must do the same. The one deliberate exception is the
-   * transient "copied" flash after Alt+C, which stays blue so it remains
-   * distinguishable from hovering.
+   * the plugin readout must do the same. There is no longer any blue anywhere
+   * in the readout's styling.
    */
   const css = t.doc.getElementById('bst-style').textContent;
   const soloHover = (css.match(/\.bst-sec\.bst-sec--solo:hover\{[^}]*\}/) || [''])[0];
@@ -265,11 +240,8 @@ async function testModern() {
   checkThat('it re-declares the borrowed clock colour', soloHover.indexOf('var(--bst-clock-color') !== -1);
   checkThat('it lifts the borrowed opacity to full', /opacity:1/.test(soloHover));
   checkThat('and it brightens the text', /brightness\(/.test(soloHover));
-  const soloFlash = (css.match(/\.bst-sec\.bst-sec--solo\.bst-sec--copied\{[^}]*\}/) || [''])[0];
-  checkThat(
-    'the copied flash stays distinguishable (blue, no brightening)',
-    soloFlash.indexOf('#00aeec') !== -1 && soloFlash.indexOf('brightness') === -1
-  );
+  checkThat('no rule anywhere reintroduces bilibili blue', css.indexOf('#00aeec') === -1);
+  checkThat('and the removed copied-flash state is gone', css.indexOf('bst-sec--copied') === -1);
   const baseRule = (css.match(/\.bst-sec\{[^}]*\}/) || [''])[0];
   checkThat('the brightening is transitioned, not instant', /transition:[^;}]*filter/.test(baseRule));
 
@@ -382,26 +354,64 @@ async function testModern() {
   t.api.config.clickToToggle = true;
   t.api.applyConfig();
 
-  group('modern player: Alt+C still copies the timepoint link');
-  const clipBefore = t.clipboard.length;
-  t.doc.dispatchEvent(new t.window.KeyboardEvent('keydown', { key: 'c', altKey: true, bubbles: true, cancelable: true }));
+  group('modern player: the Alt+C copy feature is gone');
+  const altC = new t.window.KeyboardEvent('keydown', {
+    key: 'c', altKey: true, bubbles: true, cancelable: true,
+  });
+  t.doc.dispatchEvent(altC);
   await settle();
-  check('clipboard write happened', t.clipboard.length, clipBefore + 1);
-  check(
-    'clipboard holds the timepoint url',
-    t.clipboard[t.clipboard.length - 1],
-    'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2&t=83'
-  );
+  checkThat('Alt+C is no longer swallowed, so the page keeps its own binding', !altC.defaultPrevented);
+  checkThat('the timepoint-link builder is off the debug surface', !('buildTimepointUrl' in t.api));
+  checkThat('the copy entry point is off the debug surface too', !('copyCurrentTimepoint' in t.api));
 
   group('modern player: menu commands');
-  checkThat('registers menu entries', t.menus.length >= 5);
+  checkThat('registers menu entries', t.menus.length >= 4);
   checkThat('mentions the master switch', t.menus.some((m) => m.includes('显示秒数')));
   checkThat('offers the style toggle', t.menus.some((m) => m.includes('样式：')));
   checkThat('offers the click toggle', t.menus.some((m) => m.includes('点击时间点切换样式')));
   checkThat('mentions precision', t.menus.some((m) => m.includes('小数位数')));
   checkThat('offers the remaining/elapsed mode toggle', t.menus.some((m) => m.includes('模式：')));
-  checkThat('still offers copying the timepoint', t.menus.some((m) => m.includes('复制当前时间点链接')));
+  checkThat('no longer offers copying the timepoint', !t.menus.some((m) => m.includes('复制')));
+  checkThat('and no longer advertises the Alt+C shortcut', !t.menus.some((m) => m.includes('Alt+C')));
   checkThat('no longer advertises the removed hide-native option', !t.menus.some((m) => m.includes('隐藏原生时间')));
+
+  t.window.close();
+}
+
+/* ------------------------------------------------------------------ *
+ * 2b. Config migration
+ * ------------------------------------------------------------------ */
+
+/**
+ * A config written by an older build is a real thing users have in their
+ * manager's storage. Two things must happen on load: keys belonging to deleted
+ * features must not linger, and a schema bump must reset the *display* keys
+ * (otherwise an old `precision: 1` would keep painting `387.0s`).
+ */
+function testConfigMigration() {
+  group('config migration from an older schema');
+  const stale = JSON.stringify({
+    configVersion: 2,
+    enabled: true,
+    style: 'native',
+    mode: 'elapsed',
+    precision: 1,
+    clickToToggle: false,
+    altCShortcut: false,
+    showDuration: true,
+    hideNative: true,
+    copyOnClick: true,
+  });
+  const t = boot(PLAYER_MODERN, { stored: stale });
+
+  checkThat('the switch for the deleted copy feature is dropped', !('altCShortcut' in t.api.config));
+  checkThat('the other retired keys are dropped too', !('hideNative' in t.api.config) && !('copyOnClick' in t.api.config) && !('showDuration' in t.api.config));
+  checkThat('the schema version is stamped forward', t.api.config.configVersion !== 2);
+  check('a stale style is reset by the bump', t.api.config.style, 'plugin');
+  check('and so is a stale precision', t.api.config.precision, 0);
+  check('but surviving switches still carry over', t.api.config.mode, 'elapsed');
+  check('including the ones the user turned off', t.api.config.clickToToggle, false);
+  check('the readout honours the migrated precision', t.api.formatSeconds(387.4, t.api.config.precision), '387s');
 
   t.window.close();
 }
@@ -492,7 +502,7 @@ async function testBare() {
     'a startup banner proves the script ran at all',
     t.logs.some((l) => l.indexOf('[bili-sec-timepoint]') === 0)
   );
-  checkThat('the banner reports the version', t.logs.some((l) => l.indexOf('v1.4.0') !== -1));
+  checkThat('the banner reports the version', t.logs.some((l) => l.indexOf('v1.5.0') !== -1));
 
   group('bare player: recovery when a clock finally shows up');
   // Bilibili renders the control bar a moment after the video element appears,
@@ -702,5 +712,6 @@ await testBare();
 await testSettings();
 await testSpaNavigation();
 testFullscreenSafety();
+testConfigMigration();
 
 process.exit(report() ? 0 : 1);

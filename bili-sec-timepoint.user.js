@@ -2,9 +2,9 @@
 // @name         Bilibili 秒级时间点 (bili-sec-timepoint)
 // @name:en      Bilibili Second Timepoint
 // @namespace    https://github.com/local/bili-sec-timepoint
-// @version      1.4.0
-// @description  把 B 站播放器的时间区域改成只显示「距离视频结束还剩多少秒」；点击时间点即可在插件样式与 B 站默认样式之间切换，Alt+C 复制带 ?t= 的时间点链接。
-// @description:en  Replace the bilibili player clock with a plain seconds-remaining countdown. Click the timepoint to switch back to bilibili's own clock; Alt+C copies a ?t=<seconds> link.
+// @version      1.5.0
+// @description  把 B 站播放器的时间区域改成只显示「距离视频结束还剩多少秒」；点击时间点即可在插件样式与 B 站默认样式之间切换。
+// @description:en  Replace the bilibili player clock with a plain seconds-remaining countdown. Click the timepoint to switch back to bilibili's own clock.
 // @author       bili-sec-timepoint
 // @icon         https://www.bilibili.com/favicon.ico
 // @match        *://www.bilibili.com/*
@@ -14,7 +14,6 @@
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        GM_unregisterMenuCommand
-// @grant        GM_setClipboard
 // @noframes
 // ==/UserScript==
 
@@ -50,14 +49,12 @@
 
   const CLS_SEC = 'bst-sec';            // the live seconds readout
   const CLS_SOLO = 'bst-sec--solo';     // ...when it is the ONLY time shown
-  const CLS_FLASH = 'bst-sec--copied';  // "copied" feedback state
   const CLS_STYLE = 'bst-style';
 
   const STORE_KEY = 'bst:config';
-  const CONFIG_VERSION = 2;             // bump to reset display keys on upgrade
-  const VERSION = '1.4.0';
+  const CONFIG_VERSION = 3;             // bump to reset display keys on upgrade
+  const VERSION = '1.5.0';
   const HEARTBEAT_MS = 500;
-  const FLASH_MS = 1100;
   const TICK_MIN_INTERVAL_MS = 80;      // throttle for the per-frame update loop
 
   /** Leaf text that looks like a player clock, e.g. `02:31` or `1:02:31`. */
@@ -105,7 +102,6 @@
     mode: 'remaining',        // 'remaining' (countdown) | 'elapsed' (count-up)
     precision: 0,             // decimals in the live readout (0..3)
     clickToToggle: true,      // click the timepoint to switch styles
-    altCShortcut: true,       // Alt+C copies the current timepoint
   };
 
   /**
@@ -185,11 +181,13 @@
      * `style` axis, and the default precision dropped from one decimal to whole
      * seconds. A config saved by an older version must not keep the old look
      * (`00:02 387.0s / 06:29`), so reset the display keys once per schema bump
-     * while carrying over the switches that survived the redesign.
+     * while carrying over the switches that survived the redesign. `altCShortcut`
+     * is deleted outright because the copy feature it guarded no longer exists.
      */
     delete merged.showDuration;
     delete merged.hideNative;
     delete merged.copyOnClick;
+    delete merged.altCShortcut;
     if (stored.configVersion !== CONFIG_VERSION) {
       merged.configVersion = CONFIG_VERSION;
       merged.style = DEFAULT_CONFIG.style;
@@ -357,68 +355,12 @@
    * can be restored exactly.
    */
 
-  /**
-   * Turn the current page URL into a timepoint link.
-   * Bilibili's `t` parameter is an integer number of seconds; `p` (part) and
-   * every other query parameter are preserved.
-   */
-  function buildTimepointUrl(sec, href) {
-    let url;
-    try {
-      url = new URL(href || location.href);
-    } catch (_) {
-      return String(href || location.href);
-    }
-    url.hash = '';
-    const clamped = Math.max(0, Math.floor(Number.isFinite(sec) ? sec : 0));
-    url.searchParams.set('t', String(clamped));
-    return url.toString();
-  }
-
   function queryFirst(selectors) {
     for (let i = 0; i < selectors.length; i++) {
       const el = document.querySelector(selectors[i]);
       if (el) return el;
     }
     return null;
-  }
-
-  function copyText(text) {
-    return new Promise(function (resolve) {
-      if (typeof GM_setClipboard === 'function') {
-        try {
-          GM_setClipboard(text, 'text');
-          resolve(true);
-          return;
-        } catch (_) {
-          /* fall through to the DOM strategies */
-        }
-      }
-      if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-        navigator.clipboard.writeText(text).then(
-          function () { resolve(true); },
-          function () { resolve(copyViaTextarea(text)); }
-        );
-        return;
-      }
-      resolve(copyViaTextarea(text));
-    });
-  }
-
-  function copyViaTextarea(text) {
-    try {
-      const ta = document.createElement('textarea');
-      ta.value = text;
-      ta.setAttribute('readonly', '');
-      ta.style.cssText = 'position:fixed;top:-1000px;left:-1000px;opacity:0;';
-      document.body.appendChild(ta);
-      ta.select();
-      const ok = document.execCommand && document.execCommand('copy');
-      ta.remove();
-      return !!ok;
-    } catch (_) {
-      return false;
-    }
   }
 
   /* ------------------------------------------------------------------ *
@@ -490,7 +432,6 @@
     lastTickAt: 0,
     frameHandle: null,
     framePending: false,
-    flashTimer: 0,
     /** Consecutive ticks with no resolvable clock node; gates the warning only. */
     missCount: 0,
   };
@@ -513,8 +454,7 @@
       '  cursor:pointer;user-select:none;white-space:nowrap;',
       '  transition:opacity .15s ease,color .15s ease,filter .15s ease;',
       '}',
-      '.' + CLS_SEC + ':hover{opacity:1;color:#00aeec;}',
-      '.' + CLS_SEC + '.' + CLS_FLASH + '{opacity:1;color:#00aeec;}',
+      '.' + CLS_SEC + ':hover{opacity:1;}',
       /*
        * Solo variant: the readout is standing in for bilibili's entire clock,
        * so it lives *inside* the clock's own box and copies the clock's own
@@ -531,19 +471,13 @@
        * Hover feedback is deliberately NOT a colour change. bilibili's own
        * clock stays white and merely brightens when you point at it, so we do
        * the same: lift the copied opacity to 1 and give it a small brightness
-       * boost. `color` is re-declared so the generic `.bst-sec:hover` blue
-       * above cannot leak in.
+       * boost. `color` is re-declared so nothing darker can leak in from a
+       * future generic rule.
        */
       '.' + CLS_SEC + '.' + CLS_SOLO + ':hover{',
       '  color:var(--bst-clock-color,inherit);',
       '  opacity:1;filter:brightness(1.35);',
       '}',
-      /*
-       * The one place blue is still used: the ~1s "copied" confirmation after
-       * Alt+C. That is a transient state, not a hover, and it needs to be
-       * distinguishable from the hover brightening.
-       */
-      '.' + CLS_SEC + '.' + CLS_SOLO + '.' + CLS_FLASH + '{color:#00aeec;opacity:1;filter:none;}',
     ].join('\n');
     (document.head || document.documentElement).appendChild(style);
   }
@@ -563,7 +497,7 @@
   /** Tooltip for the live readout; wording follows the current mode. */
   function liveBadgeTitle() {
     const what = config.mode === 'remaining' ? '剩余时间' : '已播时间';
-    return what + '（秒）。点击时间点切换显示样式，Alt+C 复制当前时间点链接';
+    return what + '（秒）。点击时间点切换显示样式';
   }
 
   /**
@@ -637,10 +571,6 @@
    * would end up with two readouts. Sweeping by class makes that impossible.
    */
   function removeBadge() {
-    if (state.flashTimer) {
-      clearTimeout(state.flashTimer);
-      state.flashTimer = 0;
-    }
     if (state.badge && state.badge.isConnected) state.badge.remove();
     state.badge = null;
     state.badgeAnchor = null;
@@ -728,7 +658,7 @@
     if (!video) return;
     state.video = video;
 
-    if (state.badge && state.badge.isConnected && !state.flashTimer) {
+    if (state.badge && state.badge.isConnected) {
       const text = formatSeconds(readoutSeconds(video), config.precision);
       if (force || text !== state.lastText) {
         state.badge.textContent = text;
@@ -778,34 +708,6 @@
     video.addEventListener('play', function () { update(true); scheduleFrame(); });
     video.addEventListener('pause', function () { update(true); });
     video.addEventListener('timeupdate', function () { update(false); });
-  }
-
-  /* ------------------------------------------------------------------ *
-   * Copy timepoint
-   * ------------------------------------------------------------------ */
-
-  function flash(message) {
-    const badge = state.badge;
-    if (!badge || !badge.isConnected) return;
-    if (state.flashTimer) clearTimeout(state.flashTimer);
-    badge.textContent = message;
-    badge.classList.add(CLS_FLASH);
-    state.flashTimer = setTimeout(function () {
-      state.flashTimer = 0;
-      if (badge.isConnected) badge.classList.remove(CLS_FLASH);
-      state.lastText = null;
-      update(true);
-    }, FLASH_MS);
-  }
-
-  function copyCurrentTimepoint() {
-    const video = state.video || resolveVideo();
-    if (!video) return;
-    const seconds = video.currentTime;
-    const url = buildTimepointUrl(seconds);
-    copyText(url).then(function (ok) {
-      flash(ok ? '已复制 ' + Math.floor(seconds) + 's' : '复制失败');
-    });
   }
 
   /* ------------------------------------------------------------------ *
@@ -892,11 +794,6 @@
       (config.clickToToggle ? '✅' : '⬜') + ' 点击时间点切换样式',
       function () { config.clickToToggle = !config.clickToToggle; applyConfig(); }
     ));
-    menuIds.push(GM_registerMenuCommand(
-      (config.altCShortcut ? '✅' : '⬜') + ' Alt+C 复制时间点',
-      function () { config.altCShortcut = !config.altCShortcut; applyConfig(); }
-    ));
-    menuIds.push(GM_registerMenuCommand('复制当前时间点链接', copyCurrentTimepoint));
   }
 
   function applyConfig() {
@@ -911,26 +808,6 @@
     if (state.badge) state.badge.title = liveBadgeTitle();
     update(true);
     scheduleFrame();
-  }
-
-  /* ------------------------------------------------------------------ *
-   * Keyboard
-   * ------------------------------------------------------------------ */
-
-  function isTypingTarget(el) {
-    if (!el) return false;
-    const tag = (el.tagName || '').toLowerCase();
-    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable;
-  }
-
-  function onKeyDown(event) {
-    if (!config.enabled || !config.altCShortcut) return;
-    if (!event.altKey || event.ctrlKey || event.metaKey) return;
-    if (String(event.key).toLowerCase() !== 'c') return;
-    if (isTypingTarget(event.target)) return;
-    event.preventDefault();
-    event.stopPropagation();
-    copyCurrentTimepoint();
   }
 
   /* ------------------------------------------------------------------ *
@@ -978,7 +855,6 @@
     ensureInjected();
     scheduleFrame();
     setInterval(heartbeat, HEARTBEAT_MS);
-    document.addEventListener('keydown', onKeyDown, true);
     // Capture-phase, so we run before any handler bilibili bound on the clock.
     document.addEventListener('mousedown', onTimepointMouseDown, true);
     document.addEventListener('click', onTimepointClick, true);
@@ -1049,7 +925,6 @@
     heartbeat: heartbeat,
     scheduleFrame: scheduleFrame,
     teardown: teardown,
-    buildTimepointUrl: buildTimepointUrl,
     formatSeconds: formatSeconds,
     readoutSeconds: readoutSeconds,
     applyNativeVisibility: applyNativeVisibility,
@@ -1060,7 +935,6 @@
     resolveDividerEl: resolveDividerEl,
     guessTimeNodes: guessTimeNodes,
     resolveVideo: resolveVideo,
-    copyCurrentTimepoint: copyCurrentTimepoint,
     toggleStyle: toggleStyle,
     isTimepointTarget: isTimepointTarget,
     applyConfig: applyConfig,
